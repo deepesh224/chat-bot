@@ -1,0 +1,432 @@
+import pygame
+import sys
+import random
+import time
+import threading
+import cv2
+from transformers import ViltProcessor, ViltForQuestionAnswering
+from PIL import Image
+import torch
+import google.generativeai as genai
+import speech_recognition as sr
+import pyttsx3
+import subprocess
+import os
+import asyncio
+from datetime import datetime, timedelta
+import spacy
+
+# Configure the API key for Google Generative AI
+genai.configure(api_key="AIzaSyCLvXV0su98uxXa3NbOT8S0HaqKQf2macs")
+
+# Initialize the VILT model and processor for image question answering
+processor = ViltProcessor.from_pretrained("dandelin/vilt-b32-finetuned-vqa")
+model = ViltForQuestionAnswering.from_pretrained("dandelin/vilt-b32-finetuned-vqa")
+
+# Initialize text-to-speech engine
+engine = pyttsx3.init()
+
+# Configure Google Generative AI (Gemini) model
+generation_config = {
+    "temperature": 0.7,
+    "top_p": 0.9,
+    "top_k": 50,
+    "max_output_tokens": 8192,
+    "response_mime_type": "text/plain",
+}
+
+safety_settings = [
+    {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
+    {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
+    {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
+    {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
+]
+
+chat_model = genai.GenerativeModel(
+    model_name="gemini-1.5-flash",
+    safety_settings=safety_settings,
+    generation_config=generation_config,
+)
+
+chat_session = chat_model.start_chat(history=[])
+
+# Initialize Pygame
+pygame.init()
+
+# Screen dimensions
+screen_width = 800
+screen_height = 600
+
+# Colors
+white = (255, 255, 255)
+black = (0, 0, 0)
+light_green = (144, 238, 144)
+
+# Set up the display
+screen = pygame.display.set_mode((screen_width, screen_height))
+pygame.display.set_caption('Vector-like Expressive Eyes and Lips')
+
+# Frame rate
+clock = pygame.time.Clock()
+FPS = 30
+
+# Eye parameters
+eye_width = 100
+eye_height = 100
+pupil_radius = 20
+blink_duration = 0.1  # Duration of a blink
+last_blink_time = time.time()
+blink_interval = 3  # Time between blinks
+
+# Eye positions
+left_eye_center = (screen_width // 2 - 150, screen_height // 2)
+right_eye_center = (screen_width // 2 + 50, screen_height // 2)
+
+# Lips parameters
+lip_width = 200
+lip_height = 50
+lip_center = (screen_width // 2, screen_height // 2 + 150)
+lip_color = black
+lip_talking = False
+
+# Pupil offset limits
+pupil_offset_limit = 20
+
+# Emotions
+emotions = ['happy', 'sad', 'surprised']
+current_emotion = 'happy'
+
+# Blink animation variables
+blink_start_time = 0
+blink_phase = 0  # 0: not blinking, 1: closing, 2: opening
+
+# Pupil movement variables
+pupil_target_offset = [0, 0]
+pupil_offset = [0, 0]
+pupil_speed = 0.5  # Adjust this value to change the speed of the pupil movement
+
+# Initialize the recognizer, TTS engine, and spaCy model for reminders
+recognizer = sr.Recognizer()
+nlp = spacy.load('en_core_web_sm')
+
+# Function to recognize speech and convert it to text
+async def recognize_speech():
+    with sr.Microphone() as source:
+        recognizer.adjust_for_ambient_noise(source)
+        print("Listening...")
+        audio = recognizer.listen(source)
+        try:
+            text = recognizer.recognize_google(audio)
+            print(f"You said: {text}")
+            return text
+        except sr.UnknownValueError:
+            print("Sorry, I did not understand that.")
+            return None
+        except sr.RequestError:
+            print("Could not request results; check your network connection.")
+            return None
+
+# Function to speak text
+def speak(text):
+    global lip_talking
+    lip_talking = True
+    engine.say(text)
+    engine.runAndWait()
+    lip_talking = False
+
+# Function to parse the reminder text and extract time using spaCy
+def parse_reminder(text):
+    doc = nlp(text)
+    time_value = None
+    time_unit = None
+    reminder_message = None
+
+    for ent in doc.ents:
+        if ent.label_ == "TIME":
+            time_value, time_unit = extract_time_value(ent.text)
+        if ent.label_ == "DATE":
+            time_value, time_unit = extract_time_value(ent.text)
+
+    reminder_message = " ".join([token.text for token in doc if token.ent_type_ not in ["TIME", "DATE"]])
+    if time_value and time_unit:
+        reminder_time = calculate_reminder_time(time_value, time_unit)
+        return reminder_time, reminder_message
+    else:
+        return None, None
+
+def extract_time_value(time_text):
+    time_text = time_text.lower()
+    time_value = None
+    time_unit = None
+
+    if "second" in time_text:
+        time_unit = "second"
+        time_value = int(''.join(filter(str.isdigit, time_text)))
+    elif "minute" in time_text:
+        time_unit = "minute"
+        time_value = int(''.join(filter(str.isdigit, time_text)))
+    elif "hour" in time_text:
+        time_unit = "hour"
+        time_value = int(''.join(filter(str.isdigit, time_text)))
+
+    return time_value, time_unit
+
+def calculate_reminder_time(time_value, time_unit):
+    if time_unit == "second":
+        reminder_time = datetime.now() + timedelta(seconds=time_value)
+    elif time_unit == "minute":
+        reminder_time = datetime.now() + timedelta(minutes=time_value)
+    elif time_unit == "hour":
+        reminder_time = datetime.now() + timedelta(hours=time_value)
+    else:
+        reminder_time = None
+    return reminder_time
+
+# Main function to handle reminders
+async def set_reminder():
+    speak("What reminder would you like to set?")
+    reminder_text = await recognize_speech()
+    if reminder_text:
+        reminder_time, reminder_message = parse_reminder(reminder_text)
+        if reminder_time:
+            speak(f"Reminder set for {reminder_message} at {reminder_time.strftime('%H:%M:%S')}")
+            while datetime.now() < reminder_time:
+                await asyncio.sleep(1)
+            speak(f"guru ji Reminder: {reminder_message}")
+        else:
+            speak("Sorry, I could not understand the time for the reminder.")
+    else:
+        speak("No reminder set.")
+
+# Function to draw an eye
+def draw_eye(center, blink_phase, blink_progress, pupil_offset=(0, 0), emotion='happy'):
+    rect = pygame.Rect(center[0] - eye_width // 2, center[1] - eye_height // 2, eye_width, eye_height)
+
+    if blink_phase == 1:
+        # Closing
+        blink_height = int(eye_height * (1 - blink_progress))
+        pygame.draw.rect(screen, light_green, rect, border_radius=20)
+        pygame.draw.rect(screen, black, [rect.x, rect.y + blink_height // 2, rect.width, eye_height - blink_height],
+                         border_radius=20)
+    elif blink_phase == 2:
+        # Opening
+        blink_height = int(eye_height * blink_progress)
+        pygame.draw.rect(screen, light_green, rect, border_radius=20)
+        pygame.draw.rect(screen, black, [rect.x, rect.y + blink_height // 2, rect.width, eye_height - blink_height],
+                         border_radius=20)
+    else:
+        pygame.draw.rect(screen, light_green, rect, border_radius=20)
+        if emotion == 'happy':
+            pygame.draw.circle(screen, black, (center[0] + pupil_offset[0], center[1] + pupil_offset[1]), pupil_radius)
+        elif emotion == 'sad':
+            pygame.draw.circle(screen, black, (center[0] + pupil_offset[0], center[1] + pupil_offset_limit // 2),
+                               pupil_radius)
+        elif emotion == 'surprised':
+            pygame.draw.circle(screen, black, center, pupil_radius + 10)
+
+# Function to draw lips
+def draw_lips(lip_center, talking):
+    lip_rect = pygame.Rect(lip_center[0] - lip_width // 2, lip_center[1] - lip_height // 2, lip_width, lip_height)
+    pygame.draw.arc(screen, lip_color, lip_rect, 0, 3.14, 2)  # Draw the upper lip
+
+    if talking:
+        for i in range(1, 4):
+            pygame.draw.arc(screen, lip_color, lip_rect.inflate(0, -i * 10), 0, 3.14, 2)
+    else:
+        pygame.draw.line(screen, lip_color, (lip_rect.left, lip_rect.centery), (lip_rect.right, lip_rect.centery),
+                         2)  # Draw the lower lip
+
+def run_eye_animation():
+    global blink_phase, blink_start_time, last_blink_time, pupil_offset, pupil_target_offset, lip_talking
+    running = True
+    while running:
+        current_time = time.time()
+        screen.fill(white)
+
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                running = False
+                pygame.quit()
+                sys.exit()
+
+        # Update blink phase
+        if blink_phase == 0 and current_time - last_blink_time > blink_interval:
+            blink_phase = 1
+            blink_start_time = current_time
+        elif blink_phase == 1 and current_time - blink_start_time > blink_duration / 2:
+            blink_phase = 2
+            blink_start_time = current_time
+        elif blink_phase == 2 and current_time - blink_start_time > blink_duration / 2:
+            blink_phase = 0
+            last_blink_time = current_time
+
+        # Calculate blink progress
+        if blink_phase == 1:
+            blink_progress = (current_time - blink_start_time) / (blink_duration / 2)
+        elif blink_phase == 2:
+            blink_progress = (current_time - blink_start_time) / (blink_duration / 2)
+        else:
+            blink_progress = 0
+
+        # Update pupil movement towards target
+        if current_emotion != 'surprised':
+            for i in range(2):
+                if pupil_offset[i] < pupil_target_offset[i]:
+                    pupil_offset[i] += pupil_speed
+                    if pupil_offset[i] > pupil_target_offset[i]:
+                        pupil_offset[i] = pupil_target_offset[i]
+                elif pupil_offset[i] > pupil_target_offset[i]:
+                    pupil_offset[i] -= pupil_speed
+                    if pupil_offset[i] < pupil_target_offset[i]:
+                        pupil_offset[i] = pupil_target_offset[i]
+        else:
+            pupil_offset = [0, 0]
+
+        # Change pupil target offset randomly
+        if current_emotion != 'surprised' and random.randint(0,
+                                                             100) < 2:  # Adjust the probability for how often the target changes
+            pupil_target_offset = [random.randint(-pupil_offset_limit, pupil_offset_limit),
+                                   random.randint(-pupil_offset_limit, pupil_offset_limit)]
+
+        # Draw eyes
+        draw_eye(left_eye_center, blink_phase, blink_progress, pupil_offset, current_emotion)
+        draw_eye(right_eye_center, blink_phase, blink_progress, pupil_offset, current_emotion)
+
+        # Draw lips
+        draw_lips(lip_center, lip_talking)
+
+        pygame.display.flip()
+        clock.tick(FPS)
+
+    pygame.quit()
+    sys.exit()
+
+def capture_image():
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        print("Error: Could not open webcam.")
+        return None
+    ret, frame = cap.read()
+    if not ret:
+        print("Error: Could not read frame.")
+        return None
+    cv2.imshow('Captured Image', frame)
+    cv2.waitKey(1000)
+    cv2.destroyAllWindows()
+    cap.release()
+    image_path = '../../captured_image.jpg'
+    cv2.imwrite(image_path, frame)
+    return image_path
+
+def answer_question(image_path, question):
+    processor = ViltProcessor.from_pretrained("dandelin/vilt-b32-finetuned-vqa")
+    model = ViltForQuestionAnswering.from_pretrained("dandelin/vilt-b32-finetuned-vqa")
+    image = Image.open(image_path)
+    encoding = processor(image, question, return_tensors="pt")
+    with torch.no_grad():
+        outputs = model(**encoding)
+    logits = outputs.logits
+    predicted_index = logits.argmax(-1).item()
+    answer = model.config.id2label[predicted_index]
+    return answer
+
+def open_application(app_name):
+    applications = {
+        'notepad': 'notepad.exe',
+        'calculator': 'calc.exe',
+        'paint': 'mspaint.exe',
+        'command prompt': 'cmd.exe',
+        'brave': 'brave.exe',
+        'firefox': 'firefox.exe'
+    }
+    if app_name in applications:
+        subprocess.Popen(applications[app_name])
+        speak(f"Opening {app_name}")
+    else:
+        speak("Sorry, I can't open that application.")
+
+def chatbot_response(user_input):
+    user_input = user_input.lower()
+    responses = {
+        "i love you" or "i love u": "I love you too guru ji!",
+        "i hate you" or "i hate u": "Why do you hate me guru ji?",
+        "i'm happy" or "i am happy": "That's great to hear guru ji!",
+        "i'm sad" or "i am sad": "I'm sorry to hear that guru ji. How can I help?",
+        "i'm angry" or "i am angry": "Take a deep breath guru ji. What's bothering you?",
+        "thank you" or "thank u": "You're welcome guru ji!",
+        "hello": "Hi guru ji! How can I help you today?",
+        "goodbye": "Goodbye guru ji! Have a great day!",
+        "how are you" or "how r u": "I'm just a bunch of code guru ji, but thanks for asking!"
+    }
+    return responses.get(user_input, None)
+
+async def main():
+    # Run eye animation in a separate thread
+    eye_animation_thread = threading.Thread(target=run_eye_animation)
+    eye_animation_thread.start()
+
+    while True:
+        print("Say 'chitti' to start...")
+        text = await recognize_speech()
+
+        if text and 'chitti' in text.lower():
+            while True:
+                speak("Hello! Guru ji, How can I assist you?")
+                print(" Please say 'image' to take a photo, 'ask' to start a conversation, 'open' to open an application, 'remind me' to set a reminder, or 'exit' to quit.")
+                command = await recognize_speech()
+                if command is None:
+                    continue
+
+                if 'exit' in command.lower():
+                    speak("Exiting the program.")
+                    pygame.quit()
+                    eye_animation_thread.join()
+                    return
+
+                elif 'image' in command.lower():
+                    image_path = capture_image()
+                    if image_path:
+                        speak("guru ji ,image capturing completed ")
+                        while True:
+                            print("Please ask your question about the image or say 'exit' to quit.")
+                            question = await recognize_speech()
+                            if question is None:
+                                continue
+                            if 'exit' in question.lower():
+                                speak("Exiting the image question mode.")
+                                break
+                            answer = answer_question(image_path, question)
+                            speak(f"The answer is: {answer}")
+                            print(f"Answer: {answer}")
+
+                elif 'ask' in command.lower():
+                    speak("entering to chat mode")
+                    while True:
+                        print("You can now ask me anything or say 'exit' to quit.")
+                        question = await recognize_speech()
+                        if question is None:
+                            continue
+                        if 'exit' in question.lower():
+                            speak("Exiting the chat mode.")
+                            break
+                        response = chatbot_response(question)
+                        if response:
+                            print(f"Chatbot: {response}")
+                            speak(response)
+                        else:
+                            response = chat_session.send_message(question)
+                            print("AI:", response.text)
+                            speak(response.text)
+
+                elif 'open' in command.lower():
+                    speak("Which application would you like to open guru ji?")
+                    app_name = await recognize_speech()
+                    if app_name:
+                        open_application(app_name)
+
+                elif 'remind me' in command.lower():
+                    await set_reminder()
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
